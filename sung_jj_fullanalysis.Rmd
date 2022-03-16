@@ -1,0 +1,532 @@
+---
+title: "STAT 219 Final Project Report - Full Analysis"
+author: "JJ Sung"
+date: "5/28/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Clean workspace
+```{r clean}
+rm(list=ls())
+```
+
+Packages
+```{r packages}
+library(rgdal)
+library(spatstat)
+library(raster)
+library(tigris)
+library(ggplot2)
+library(broom)
+library(tidyverse)
+library(ggmap)
+library(spdep)
+library(sp)
+library(tidycensus)
+library(maditr)
+library(spatialreg)
+library(gridExtra)
+library(rgeos)
+library(readxl)
+library(devtools)
+devtools::install_github("paezha/Spatial-Statistics-Course", subdir = "geog4ga3")
+library(geog4ga3)
+library(car)
+library(MASS)
+library(leaps)
+```
+
+## US Vaccination Sites
+```{r vacc}
+#load the dataset
+us_vaccSites <- read.csv("Covid19_Vacc_Provider_Locations_US_122921.csv", 
+                         header = TRUE)
+
+#descriptive statistics
+class(us_vaccSites)
+summary(us_vaccSites) #37890 sites
+
+#remove duplicated points
+length(us_vaccSites$X)
+us_vaccSites <- us_vaccSites[-which(duplicated(us_vaccSites[,c("X","Y")])),]
+length(us_vaccSites$X) #1420 locations removed
+
+#clean data so only contiguous US States
+length(us_vaccSites$X)
+us_vaccSites <- us_vaccSites[!(us_vaccSites$X <= -125),]
+length(us_vaccSites$X) #239 removed
+
+#geocoding NA's
+length(which(is.na(us_vaccSites$X)))
+us_vaccSites_geocode <- us_vaccSites[which(is.na(us_vaccSites$X)),]
+
+#omit NA (no information available)
+length(us_vaccSites$X)
+us_vaccSites <- us_vaccSites %>% filter(!is.na(us_vaccSites$X))
+length(which(is.na(us_vaccSites$X)))
+length(us_vaccSites$X) #36230 remaining
+
+#assign initial projection
+coordinates(us_vaccSites) <- ~X+Y
+proj4string(us_vaccSites)
+```
+
+Brief comparison between old and recent datasets
+```{r comparison}
+#old1 (April 16)
+us_vaccSites_apr <- read.csv("Covid-19_Vaccination_Provider_Locations_in_the_United_States.csv", 
+                             header=TRUE)
+length(us_vaccSites_apr$X) #21793
+us_vaccSites_apr <- us_vaccSites_apr[-which(duplicated(us_vaccSites_apr[,c("X","Y")])),]
+us_vaccSites_apr <- us_vaccSites_apr[!(us_vaccSites_apr$X <= -125),]
+us_vaccSites_apr <- us_vaccSites_apr %>% filter(!is.na(us_vaccSites_apr$X))
+#20889 remaining
+
+
+#old2 (May 19)
+us_vaccSites_may <- read.csv("Covid-19_Vaccination_Provider_Locations_05.19.21.csv", 
+                             header=TRUE)
+length(us_vaccSites_may$X) #32957
+us_vaccSites_may <- us_vaccSites_may[-which(duplicated(us_vaccSites_may[,c("X","Y")])),]
+us_vaccSites_may <- us_vaccSites_may[!(us_vaccSites_may$X <= -125),]
+us_vaccSites_may <- us_vaccSites_may %>% filter(!is.na(us_vaccSites_may$X))
+#31706 remaining
+
+
+#new (Dec 29)
+us_vaccSites_dec <- read.csv("Covid19_Vacc_Provider_Locations_US_122921.csv", 
+                         header = TRUE)
+length(us_vaccSites_dec$X) #37890
+us_vaccSites_dec <- us_vaccSites_dec[-which(duplicated(us_vaccSites_dec[,c("X","Y")])),]
+us_vaccSites_dec <- us_vaccSites_dec[!(us_vaccSites_dec$X <= -125),]
+us_vaccSites_dec <- us_vaccSites_dec %>% filter(!is.na(us_vaccSites_dec$X))
+#36230 remaining
+
+
+#Extract coordinates
+#us_vacc_apr_coord <- data.frame(na.omit(select(us_vaccSites_apr, X, Y, name)))
+#us_vacc_may_coord <- data.frame(na.omit(select(us_vaccSites_may, X, Y, name)))
+#us_vacc_dec_coord <- data.frame(na.omit(select(us_vaccSites_dec, X, Y, name)))
+
+#plot old and new datasets
+us_map <- ggmap(get_map(c(left = -125.5, bottom = 24.90, 
+                          right = -65.3, top = 49.6), source = "stamen"))
+us_map + geom_point(data = us_vaccSites_apr, aes(x = X, y = Y), 
+                    size = 0.3, col = 'blue', main = "April 16th data")
+us_map + geom_point(data = us_vaccSites_may, aes(x = X, y = Y), 
+                    size = 0.3, col = 'blue', main = "May 19th data")
+us_map + geom_point(data = us_vaccSites_dec, aes(x = X, y = Y), 
+                    size = 0.3, col = 'blue', main = "Dec 29th data")
+```
+
+## County borders data
+```{r county}
+#Importing shapefile
+county_shape <- rgdal::readOGR(dsn = "../Capstone/cb_2018_us_county_500k/cb_2018_us_county_500k.shp")
+length(which(is.na(county_shape@data)))
+nrow(county_shape@data)
+
+#Match vaccination $ county projections
+proj4string(us_vaccSites) <- proj4string(county_shape)
+
+#Create a new column: FIPS
+county_shape@data$FIPS <- paste(county_shape@data$STATEFP, 
+                                county_shape@data$COUNTYFP, sep = "")
+length(unique(county_shape@data$STATEFP))
+```
+
+## Median income level data
+```{r medincome}
+#import data
+med_income <- read_excel("est19all.xls")
+
+#extract geocode and relevant median income data
+med_income <- med_income[-c(1,2,3), c(1,2,23)]
+
+#rename columns
+colnames(med_income) <- c("StateFIPS", "CountyFIPS", "med_income")
+
+#remove state/US rows
+length(med_income$StateFIPS)
+med_income <- med_income[!(med_income$CountyFIPS == "000"),]
+length(med_income$StateFIPS)
+
+#Create "FIPS" column
+med_income$FIPS <- paste(med_income$StateFIPS, med_income$CountyFIPS, sep = "")
+nrow(med_income)
+length(which(is.na(med_income$med_income)))
+
+#join to county_shape by FIPS
+county_shape@data <- left_join(county_shape@data, med_income)
+length(unique(county_shape@data$StateFIPS))
+
+#get rid of counties with no med_income data available
+county_shape <- county_shape[-which(is.na(county_shape@data$med_income)),]
+length(unique(county_shape@data$STATEFP))
+nrow(county_shape@data)
+```
+
+## County population by characteristic
+```{r popchar}
+#load dataset
+county_pop_char <- read.csv("cc-est2019-alldata.csv", header = TRUE)
+nrow(county_pop_char)
+
+#extract most recent info (07.01.2019)
+county_pop_char <- county_pop_char %>% filter(county_pop_char$YEAR == 12)
+
+#format STATE and COUNTY columns
+county_pop_char$COUNTY <- as.integer(county_pop_char$COUNTY)
+county_pop_char$COUNTY <- sprintf("%03d", county_pop_char$COUNTY)
+county_pop_char$STATE <- sprintf("%02d", county_pop_char$STATE)
+
+#create FIPS column
+county_pop_char$FIPS <- paste(county_pop_char$STATE, 
+                              county_pop_char$COUNTY, sep = "")
+
+#group rows by county
+test <- county_pop_char %>% group_by(CTYNAME, STNAME, FIPS) %>%
+        summarise(sum_tot_pop = sum(TOT_POP),
+              sum_tot_female = sum(TOT_FEMALE),
+              sum_tot_wam = sum(WA_MALE),
+              sum_tot_waf = sum(WA_FEMALE))
+nrow(test)
+
+#create percentage variables
+test$perc_poc <- 1 - ((test$sum_tot_waf + test$sum_tot_wam)/test$sum_tot_pop)
+test$perc_female <- test$sum_tot_female/test$sum_tot_pop
+nrow(test)
+
+#join to county_shape data
+county_shape@data <- left_join(county_shape@data, test)
+length(unique(county_shape@data$STATEFP))
+
+county_shape$med_income <- as.numeric(county_shape$med_income)
+```
+
+## Aggregating vaccination data by county
+```{r agg}
+#overlay vacc & county data
+over_data <- over(us_vaccSites, county_shape)
+length(which(is.na(over_data$GEOID)))
+
+length(us_vaccSites)
+length(unique(county_shape@data$StateFIPS))
+
+agg_data <- plyr::count(over_data, c('GEOID'))
+agg_data$GEOID <- as.factor(agg_data$GEOID)
+colnames(agg_data) <- c("GEOID", "num_vacc_sites")
+
+county_shape@data <- left_join(county_shape@data, agg_data, 
+                               by = (GEOID = "GEOID"))
+length(which(is.na(county_shape@data$num_vacc_sites)))
+
+county_shape@data$CTYNAME[which(county_shape@data$num_vacc_sites == 
+                                        max(na.rm=T, 
+                                            county_shape@data$num_vacc_sites))]
+
+county_shape@data$CTYNAME[which(county_shape@data$num_vacc_sites == 
+                                        min(na.rm=T, 
+                                            county_shape@data$num_vacc_sites))]
+nrow(county_shape@data)
+
+county_fortify <- broom::tidy(county_shape)
+county_shape$id <- row.names(county_shape)
+county_fortify <- left_join(county_fortify, county_shape@data)
+```
+
+## Plot
+```{r plot}
+hist(county_shape@data$num_vacc_sites, 
+     main = "Histogram of Number of Vaccination Sites",
+     xlab = "Number of Vaccination Sites")
+hist(county_shape@data$perc_female,
+     main = "Histogram of Female Percentage",
+     xlab = "Female Percentage")
+hist(county_shape@data$perc_poc,
+     main = "Histogram of BIPOC Percentage",
+     xlab = "BIPOC Percentage")
+hist(county_shape@data$med_income,
+     main = "Histogram of Median Household Income",
+     xlab = "Median Household Income")
+
+#logged variables
+hist(log(county_shape@data$num_vacc_sites), 
+     main = "Histogram of Number of Vaccination Sites (log)",
+     xlab = "Number of Vaccination Sites (log)")
+hist(log(county_shape@data$perc_female),
+     main = "Histogram of Female Percentage (log)",
+     xlab = "Female Percentage (log)")
+hist(log(county_shape@data$perc_poc),
+     main = "Histogram of BIPOC Percentage (log)",
+     xlab = "BIPOC Percentage (log)")
+hist(log(county_shape@data$med_income),
+     main = "Histogram of Median Household Income (log)",
+     xlab = "Median Household Income ")
+
+#US map
+us_map <- ggmap(get_map(c(left = -125.5, bottom = 24.90, 
+                          right = -65.3, top = 49.6), 
+                        source = "stamen"))
+
+#vaccination sites by county
+us_map + geom_polygon(data = county_fortify, 
+                      aes(x = long, y = lat, group = group, 
+                          fill = log(num_vacc_sites)), 
+                      col = 'grey', size = 0.1) + 
+        labs(fill = "Number of Vaccination Sites (log)") + 
+        scale_fill_distiller(palette = "Spectral")
+
+#median household income by county
+#county_fortify$med_income <- as.numeric(county_fortify$med_income)
+us_map + geom_polygon(data = county_fortify, 
+                      aes(x = long, y = lat, group = group, 
+                          fill = log(med_income)), col = 'grey', size = 0.1) + 
+        labs(fill = "Median Household Income (log)") + 
+        scale_fill_distiller(palette = "Spectral")
+
+#total population by county
+us_map + geom_polygon(data = county_fortify, 
+                      aes(x = long, y = lat, group = group, 
+                          fill = log(sum_tot_pop)), col = 'grey', size = 0.1) + 
+        labs(fill = "Total Population (log)") + 
+        scale_fill_distiller(palette = "Spectral")
+
+#total female population percentage by county
+us_map + geom_polygon(data = county_fortify, 
+                      aes(x = long, y = lat, group = group, fill = perc_female), 
+                      col = 'grey', size = 0.1) + 
+        labs(fill = "Female Percentage") + 
+        scale_fill_distiller(palette = "Spectral")
+us_map + geom_polygon(data = county_fortify, 
+                      aes(x = long, y = lat, group = group, 
+                          fill = log(perc_female)), 
+                      col = 'grey', size = 0.1) + 
+        labs(fill = "Female Percentage (log)") + 
+        scale_fill_distiller(palette = "Spectral")
+
+#total POC population percentage by county
+us_map + geom_polygon(data = county_fortify, 
+                      aes(x = long, y = lat, group = group, 
+                          fill = log(perc_poc)), col = 'grey', size = 0.1) + 
+        labs(fill = "BIPOC Percentage (log)") + 
+        scale_fill_distiller(palette = "Spectral")
+```
+
+## Areal models
+## Initial full models
+```{r linreg}
+county_shape_ref <- county_shape@data[-which(is.na(county_shape@data$num_vacc_sites)),]
+
+attach(county_shape_ref)
+
+#first-order MLR
+lin_reg <- lm(log(num_vacc_sites)~med_income+sum_tot_pop+perc_poc+perc_female, 
+              data=county_shape_ref)
+summary(lin_reg)
+
+#check multicollinearity
+vif(lin_reg) #all values smaller than 2
+
+#Full interaction model
+int_var <- subset(county_shape_ref, select = c(num_vacc_sites,med_income,
+                                                sum_tot_pop,perc_poc,
+                                                perc_female))
+full_int <- lm(log(num_vacc_sites)~.:., data = int_var)
+summary(full_int)
+```
+
+
+## Variable Selection: First-order model
+```{r}
+#Stepwise AIC
+aic.fo.mod <- stepAIC(lin_reg, direction = "both", trace = 0, k = 2)
+summary(aic.fo.mod)
+
+#Stepwise BIC
+bic.fo.mod <- stepAIC(lin_reg, direction = "both", trace = 0, k = log(50))
+summary(bic.fo.mod)
+
+#all-subset
+detach(county_shape_ref)
+attach(int_var)
+x.mod <- cbind(int_var$med_income,
+               int_var$sum_tot_pop,
+               int_var$perc_poc,
+               int_var$perc_female)
+y.mod <- int_var$num_vacc_sites
+leap.out <- leaps(x.mod, y.mod, method = c("r2"), nbest = 1)
+leap.out$which[leap.out$size==3] #R-squared
+
+leap.out <- leaps(x.mod, y.mod, method = c("Cp"), nbest = 1)
+leap.out$which[leap.out$size==3] #Mallow's Cp
+detach(int_var)
+```
+
+## Variable Selection: Interaction model
+```{r}
+#Stepwise AIC
+aic.int.mod <- stepAIC(full_int, direction = "both", trace = 0, k = 2)
+summary(aic.int.mod)
+
+#Stepwise BIC
+bic.int.mod <- stepAIC(full_int, direction = "both", trace = 0, k = log(50))
+summary(bic.int.mod)
+```
+
+
+## Cross validation
+```{r}
+#cross validation
+library(caret)
+set.seed(123)
+
+ctrl <- trainControl(method = "cv",number=10)
+cv.fo.model1 <- train(num_vacc_sites~med_income+sum_tot_pop+perc_poc+perc_female, data = int_var, method = "lm", trControl = ctrl)
+cv.fo.model2 <- train(num_vacc_sites~sum_tot_pop+perc_female, data = int_var, method = "lm", trControl = ctrl)
+cv.bic.int.model<- train(num_vacc_sites ~ med_income+sum_tot_pop+perc_poc+perc_female +med_income:sum_tot_pop+med_income:perc_poc+med_income:perc_female+sum_tot_pop:perc_poc +sum_tot_pop:perc_female, data = int_var ,method="lm",trControl=ctrl)
+
+print(cv.fo.model1)
+print(cv.fo.model2)
+print(cv.bic.int.model)
+```
+
+
+Spatial error
+```{r serror}
+#create neighborhood matrix
+set.seed(3)
+
+county_shape_nb <- county_shape
+length(county_shape_nb)
+length(which(is.na(county_shape_nb@data)))
+
+us_nb <- poly2nb(county_shape_nb)
+W_list <- nb2listw(us_nb, style = "W", zero.policy = TRUE)
+summary(us_nb)
+
+length(lin_reg$residuals)
+length(us_nb)
+
+#Moran's I
+moran.mc(lin_reg$residuals, listw = W_list, zero.policy = TRUE, nsim = 5000)
+
+vacc_sar <- errorsarlm(log(num_vacc_sites) ~ med_income + sum_tot_pop + 
+                         perc_female + perc_poc, 
+                       data = county_shape@data, 
+                       listw = W_list, zero.policy = TRUE)
+summary(vacc_sar) #AIC: 6463.9, (AIC for lm: 6836.1)
+```
+
+Spatial Lag Model
+```{r slag}
+vacc_lag <- lagsarlm(log(num_vacc_sites) ~ med_income + sum_tot_pop + perc_female + perc_poc, data = county_shape@data, listw = W_list, zero.policy = TRUE)
+summary(vacc_lag) #AIC: 6487.1
+```
+
+CAR
+```{r car}
+vacc_car <- spautolm(log(num_vacc_sites) ~ med_income + sum_tot_pop + perc_female + perc_poc, data = county_shape@data, family = "CAR", listw = W_list, zero.policy = TRUE)
+summary(vacc_car) #AIC: 6411.9
+```
+
+
+## Point Process Model
+```{r gnf}
+set.seed(3)
+range(us_vaccSites$X)
+range(us_vaccSites$Y)
+#county_shape <- county_shape[-which(county_shape$ALAND==0),]
+
+#California
+#us_vaccSites_pp <- us_vaccSites %>% as.data.frame()
+vacc_ca <- us_vaccSites[which(us_vaccSites$State == "CA"),]
+vacc_ca2 <- spTransform(vacc_ca, CRS("+init=epsg:2225"))
+
+county_ca <- county_shape[which(county_shape@data$StateFIPS == "06"),]
+ca_poly <- as(county_ca, "SpatialPolygons") #convert to SpatialPolygons
+ca_poly <- spTransform(ca_poly, CRS("+init=epsg:2225"))
+ca_one <- st_transform(st_union(st_as_sf(ca_poly)), crs = CRS("+init=epsg:2225"))
+ca_win <- as.owin(as_Spatial(ca_one))
+plot(ca_win)
+
+ca_ppp <- as.ppp(vacc_ca2@coords, W = ca_win)
+plot(ca_ppp, main = "CA vaccination sites")
+
+g_env_ca <- envelope(ca_ppp, fun = Gest, nrank = 2, nsim = 99)
+plot(g_env_ca, main = "CA vaccination sites - G function", 
+     xlim = c(0,max(g_env_ca$r)))
+
+f_env_ca <- envelope(ca_ppp, fun = Fest, nrank = 2, nsim = 99)
+plot(f_env_ca, main = "CA vaccination sites - F function", 
+     xlim = c(0,max(f_env_ca$r)))
+
+#New York
+vacc_ny <- us_vaccSites[which(us_vaccSites$State == "NY"),]
+vacc_ny2 <- spTransform(vacc_ny, CRS("+init=epsg:2261"))
+
+county_ny <- county_shape[which(county_shape@data$StateFIPS == "36"),]
+ny_poly <- as(county_ny, "SpatialPolygons") 
+ny_poly <- spTransform(ny_poly, CRS("+init=epsg:2261"))
+ny_one <- st_transform(st_union(st_as_sf(ny_poly)), crs = CRS("+init=epsg:2261"))
+ny_win <- as.owin(as_Spatial(ny_one))
+
+ny_ppp <- as.ppp(vacc_ny2@coords, W = ny_win)
+plot(ny_ppp, main = "NY vaccination sites")
+
+g_env_ny <- envelope(ny_ppp, fun = Gest, nrank = 2, nsim = 99)
+plot(g_env_ny, main = "NY vaccination sites - G function", 
+     xlim = c(0,max(g_env_ny$r)))
+
+f_env_ny <- envelope(ny_ppp, fun = Fest, nrank = 2, nsim = 99)
+plot(f_env_ny, main = "NY vaccination sites - F function", 
+     xlim = c(0,max(f_env_ny$r)))
+
+#a couple of rural areas
+#Alabama
+vacc_al <- us_vaccSites[which(us_vaccSites$State == "AL"),]
+vacc_al2 <- spTransform(vacc_al, CRS("+init=epsg:2759"))
+
+county_al <- county_shape[which(county_shape@data$StateFIPS == "01"),]
+al_poly <- as(county_al, "SpatialPolygons")
+al_poly <- spTransform(al_poly, CRS("+init=epsg:2759"))
+al_one <- st_transform(st_union(st_as_sf(al_poly)), crs = CRS("+init=epsg:2759"))
+al_win <- as.owin(as_Spatial(al_one))
+
+al_ppp <- as.ppp(vacc_al2@coords, W = al_win)
+plot(al_ppp, main = "AL vaccination sites")
+
+g_env_al <- envelope(al_ppp, fun = Gest, nrank = 2, nsim = 99)
+plot(g_env_al, main = "AL vaccination sites - G function", 
+     xlim = c(0,max(g_env_al$r)))
+
+f_env_al <- envelope(al_ppp, fun = Fest, nrank = 2, nsim = 99)
+plot(f_env_ca, main = "AL vaccination sites - F function", 
+     xlim = c(0,max(f_env_al$r)))
+
+#Kentucky
+vacc_ky <- us_vaccSites[which(us_vaccSites$State == "KY"),]
+vacc_ky2 <- spTransform(vacc_ky, CRS("+init=epsg:3088"))
+
+county_ky <- county_shape[which(county_shape@data$StateFIPS == "21"),]
+ky_poly <- as(county_ky, "SpatialPolygons")
+ky_poly <- spTransform(ky_poly, CRS("+init=epsg:3088"))
+ky_one <- st_transform(st_union(st_as_sf(ky_poly)), crs = CRS("+init=epsg:3088"))
+ky_win <- as.owin(as_Spatial(ky_one))
+
+ky_ppp <- as.ppp(vacc_ky2@coords, W = ky_win)
+plot(ky_ppp, main = "KY vaccination sites - F function")
+
+g_env_ky <- envelope(ky_ppp, fun = Gest, nrank = 2, nsim = 99)
+plot(g_env_ky, main = "KY vaccination sites - G function", 
+     xlim = c(0,max(g_env_ky$r)))
+
+f_env_ky <- envelope(ky_ppp, fun = Fest, nrank = 2, nsim = 99)
+plot(f_env_ky, main = "KY vaccination sites - F function", 
+     xlim = c(0,max(f_env_ky$r)))
+```
+
